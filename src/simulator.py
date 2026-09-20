@@ -1,10 +1,7 @@
 """
-src/simulator.py — SolGelSimulator class for Reactive MC (v5.1)
-================================================================
-[FIX v5.1]: Corrected double-counting bug in reactive moves.
-When computing de = (new_e_i + new_e_j) - (old_e_i + old_e_j),
-the pair interaction (i,j) was counted twice (once in local_energy(i)
-and once in local_energy(j)). Now de is divided by 2.0.
+src/simulator.py — SolGelSimulator class for Reactive MC (v5.2.1)
+==================================================================
+[FIX v5.2.1]: Corrected 'self.coords' to 'self.system.coords' in save_structure().
 """
 
 import numpy as np
@@ -16,12 +13,12 @@ from math import exp, sqrt, pi
 from .constants import (
     KB_EV, NA_AVOGADRO, KE_COULOMB, ATM_TO_EV_A3,
     TYPE_SI, TYPE_P, TYPE_O, MAX_COORD, BOND_FORM_CUTOFF,
-    SKIN_DEFAULT, CUTOFF_DEFAULT, WOLF_ALPHA_DEFAULT
+    SKIN_DEFAULT, CUTOFF_DEFAULT, WOLF_ALPHA_DEFAULT, TYPE_TO_ELEM
 )
 from .numba_kernels import (
     local_energy_reactive, total_energy_reactive, compute_nc_numba,
     find_o_candidates_for_nf_fast, find_nf_candidates_for_o_fast,
-    find_bonded_nfs_for_o_fast
+    find_bonded_nfs_for_o_fast, energy_decomposition
 )
 from .neighbor_list import NeighborList
 from .bond_network import BondNetwork
@@ -44,11 +41,9 @@ class SolGelSimulator:
         self.P_ext = pressure_atm * ATM_TO_EV_A3
         self.disp_volume = disp_volume
 
-        # Initialize bond network
         self.bond_network = BondNetwork(system.N_ATOMS)
         self.bond_network.set_types(system.type_indices)
 
-        # Load initial bonds
         success_count, fail_count = 0, 0
         for i, j in system.initial_bonds:
             ti = int(system.type_indices[i])
@@ -149,6 +144,28 @@ class SolGelSimulator:
         self.drift_log.append(drift)
         return drift
 
+    def decompose_energy(self):
+        """
+        Decompose total energy into components for debugging.
+        Returns dict with 'bonded', 'buckingham', 'coulomb', 'zbl', 'total'.
+        """
+        n, s, bf = self.nl.neighbors, self.nl.starts, self.nl.bond_flags
+        e_bonded, e_buck, e_coul, e_zbl = energy_decomposition(
+            self.system.coords, self.system.charges,
+            self.system.type_indices, self.type_Z,
+            self.A_mat, self.F_mat, self.C_mat, self.R_HARD_MAT,
+            n, s, bf, self.system.box, self.cutoff, self.wolf_alpha,
+            self.system.potential.zbl_a0, self.system.potential.zbl_c,
+            self.system.potential.zbl_d)
+        
+        return {
+            'bonded': e_bonded / self.system.N_ATOMS,
+            'buckingham': e_buck / self.system.N_ATOMS,
+            'coulomb': (e_coul + self.wolf_self) / self.system.N_ATOMS,
+            'zbl': e_zbl / self.system.N_ATOMS,
+            'total': (e_bonded + e_buck + e_coul + e_zbl + self.wolf_self) / self.system.N_ATOMS,
+        }
+
     def compute_nc(self) -> float:
         """Compute Network Connectivity."""
         bond_i, bond_j, _ = self.bond_network.get_bond_arrays()
@@ -159,9 +176,11 @@ class SolGelSimulator:
         """Standard MC displacement move."""
         i = int(self.rng.integers(0, self.system.N_ATOMS))
         old_pos = self.system.coords[i].copy()
-        elem = (self.system.type_to_elem[self.system.type_indices[i]]
-                if hasattr(self.system, 'type_to_elem') else 'O')
+        maxd = self.max_disp.get('O', 0.06)  # Default fallback
+        # Map type index to element for max_disp lookup
+        elem = TYPE_TO_ELEM.get(self.system.type_indices[i], 'O')
         maxd = self.max_disp.get(elem, 0.06)
+        
         n_arr, s_arr, bf = (self.nl.neighbors, self.nl.starts,
                             self.nl.bond_flags)
         
@@ -205,7 +224,6 @@ class SolGelSimulator:
         """Attempt to form a new Si-O or P-O bond."""
         self.bond_form_attempts += 1
         
-        # Find NF candidates with available coordination
         nf_candidates = [
             i for i in range(self.system.N_ATOMS)
             if self.system.type_indices[i] in (TYPE_SI, TYPE_P)
@@ -215,7 +233,6 @@ class SolGelSimulator:
             return False
         nf = nf_candidates[self.rng.integers(0, len(nf_candidates))]
         
-        # Use CSR structure for O(1) lookups
         bond_starts, bond_partners, _, _ = self.bond_network.get_bond_csr()
         cand_dist, cand_idx = find_o_candidates_for_nf_fast(
             nf, self.system.coords, self.system.type_indices,
@@ -272,7 +289,6 @@ class SolGelSimulator:
             self.system.potential.zbl_a0, self.system.potential.zbl_c,
             self.system.potential.zbl_d)
         
-        # [FIX v5.1] Divide by 2.0 to correct double-counting
         de = ((new_e_nf + new_e_o) - (old_e_nf + old_e_o)) / 2.0
         
         if de <= 0.0 or self.rng.random() < exp(-de / (KB_EV * T)):
@@ -333,7 +349,6 @@ class SolGelSimulator:
             self.system.potential.zbl_a0, self.system.potential.zbl_c,
             self.system.potential.zbl_d)
         
-        # [FIX v5.1] Divide by 2.0 to correct double-counting
         de = ((new_e_i + new_e_j) - (old_e_i + old_e_j)) / 2.0
         
         if de <= 0.0 or self.rng.random() < exp(-de / (KB_EV * T)):
@@ -346,11 +361,13 @@ class SolGelSimulator:
             return False
 
     def bond_switch_move(self, T: float) -> bool:
-        """Attempt to switch a bond from one NF to another (BO migration)."""
+        """
+        Attempt to switch a bond from one NF to another.
+        Uses recalculate_energy() for accurate delta-E computation.
+        """
         self.bond_switch_attempts += 1
         bond_starts, bond_partners, _, _ = self.bond_network.get_bond_csr()
         
-        # Find BOs (O bonded to exactly 2 NFs)
         bo_candidates = []
         for i in range(self.system.N_ATOMS):
             if self.system.type_indices[i] != TYPE_O:
@@ -378,7 +395,6 @@ class SolGelSimulator:
             return False
         old_btype = old_bond_entry[2]
         
-        # Find new NF candidates
         new_nf_candidates = find_nf_candidates_for_o_fast(
             o_atom, self.system.coords, self.system.type_indices,
             self.system.box, self.nl.neighbors, self.nl.starts,
@@ -390,20 +406,7 @@ class SolGelSimulator:
         new_nf = int(new_nf_candidates[
             self.rng.integers(0, len(new_nf_candidates))])
         
-        atoms_involved = [o_atom, old_nf, new_nf]
-        n_arr, s_arr, bf = (self.nl.neighbors, self.nl.starts,
-                            self.nl.bond_flags)
-        
-        old_energies = {}
-        for atom in atoms_involved:
-            old_energies[atom] = local_energy_reactive(
-                atom, self.system.coords, self.system.charges,
-                self.system.type_indices, self.type_Z,
-                self.A_mat, self.F_mat, self.C_mat, self.R_HARD_MAT,
-                self.system.box, self.cutoff, self.wolf_alpha,
-                n_arr, s_arr, bf,
-                self.system.potential.zbl_a0, self.system.potential.zbl_c,
-                self.system.potential.zbl_d)
+        old_total = self.recalculate_energy()
         
         removed = self.bond_network.remove_bond(old_bid)
         if removed is None:
@@ -417,22 +420,11 @@ class SolGelSimulator:
         self.nl.update_bond_flags_local(o_atom, old_nf, -1)
         self.nl.update_bond_flags_local(o_atom, new_nf, old_btype)
         
-        new_energies = {}
-        for atom in atoms_involved:
-            new_energies[atom] = local_energy_reactive(
-                atom, self.system.coords, self.system.charges,
-                self.system.type_indices, self.type_Z,
-                self.A_mat, self.F_mat, self.C_mat, self.R_HARD_MAT,
-                self.system.box, self.cutoff, self.wolf_alpha,
-                n_arr, s_arr, self.nl.bond_flags,
-                self.system.potential.zbl_a0, self.system.potential.zbl_c,
-                self.system.potential.zbl_d)
-        
-        # [FIX v5.1] Divide by 2.0 to correct double-counting
-        de = (sum(new_energies.values()) - sum(old_energies.values())) / 2.0
+        new_total = self.recalculate_energy()
+        de = new_total - old_total
         
         if de <= 0.0 or self.rng.random() < exp(-de / (KB_EV * T)):
-            self.current_energy += de
+            self.current_energy = new_total
             self.bond_switch_accepted += 1
             return True
         else:
@@ -440,6 +432,7 @@ class SolGelSimulator:
             self.bond_network.add_bond(o_atom, old_nf, old_btype)
             self.nl.update_bond_flags_local(o_atom, new_nf, -1)
             self.nl.update_bond_flags_local(o_atom, old_nf, old_btype)
+            self.current_energy = old_total
             return False
 
     def volume_move(self, T: float) -> bool:
@@ -453,7 +446,6 @@ class SolGelSimulator:
         V_new = V_old * np.exp(log_dV)
         L_new = V_new ** (1.0 / 3.0)
         
-        # [FIX] Hard density limit to prevent over-compression
         MAX_DENSITY = 2.80
         rho_new = (self.system.total_mass * 1.0e24 /
                    (NA_AVOGADRO * L_new ** 3))
@@ -578,7 +570,7 @@ class SolGelSimulator:
                     f"box={self.system.box:.4f}, NC={nc:.3f}, "
                     f"bonds={self.bond_network.n_active_bonds}, "
                     f"seed={self.seed}\n")
-            from .constants import TYPE_TO_ELEM
+            # [FIX v5.2.1] Corrected self.coords to self.system.coords
             for i in range(self.system.N_ATOMS):
                 elem = TYPE_TO_ELEM[self.system.type_indices[i]]
                 f.write(f"{elem:2s} {self.system.coords[i, 0]:12.6f} "

@@ -1,9 +1,9 @@
 """
-src/protocol.py — 5-stage Sol-Gel Protocol (v5.1)
+src/protocol.py — 5-stage Sol-Gel Protocol (v5.2)
 ===================================================
-[FIX v5.1]: Corrected debug_freq to be offset from recalc_freq
-so that drift is measured BETWEEN recalculations, not at the
-same time (which always gave 0).
+[FIX v5.2]:
+1. Reduced recalc_freq from N to N//5 for more frequent energy recalculations.
+2. Added energy decomposition logging to identify problematic energy components.
 """
 
 import logging
@@ -22,7 +22,7 @@ def run_solgel_protocol(sim, output_dir: Path, gelation_sweeps=50,
     output_dir.mkdir(parents=True, exist_ok=True)
     
     logger.info("=" * 70)
-    logger.info("SOL-GEL REACTIVE MC PROTOCOL (v5.1 Final)")
+    logger.info("SOL-GEL REACTIVE MC PROTOCOL (v5.2 Final)")
     logger.info("=" * 70)
     
     bf_freq = max(1, N // 50)
@@ -39,9 +39,9 @@ def run_solgel_protocol(sim, output_dir: Path, gelation_sweeps=50,
         logger.info(f"{desc}: T={T:.0f} K, steps={steps}")
         stage_acc = stage_att = window_acc = window_att = 0
         ema = 0.5
-        recalc_freq = max(2000, N)
         
-        # [FIX v5.1] Offset debug_freq so drift is measured between recalcs
+        # [FIX v5.2] More frequent recalculations to prevent drift accumulation
+        recalc_freq = max(500, N // 5)
         debug_freq = recalc_freq + 100
         
         pbar = tqdm(range(steps), desc=f"T={T:.0f}K")
@@ -70,13 +70,24 @@ def run_solgel_protocol(sim, output_dir: Path, gelation_sweeps=50,
             
             if sim.debug_energy and step_in_stage % debug_freq == 0:
                 drift = sim.check_energy_drift()
+                
+                # [FIX v5.2] Log energy decomposition for debugging
+                decomp = sim.decompose_energy()
+                logger.info(
+                    f"[DEBUG] Step {sim.step}: "
+                    f"Bonded={decomp['bonded']:+.3f}, "
+                    f"Buck={decomp['buckingham']:+.3f}, "
+                    f"Coul={decomp['coulomb']:+.3f}, "
+                    f"ZBL={decomp['zbl']:+.3f}, "
+                    f"Total={decomp['total']:+.3f} eV/atom, "
+                    f"Drift={drift:+.6f}")
+                
                 if abs(drift) > 0.005:
                     logger.info(f"[DEBUG] Step {sim.step}: "
                                 f"Energy drift = {drift:+.6f} eV/atom")
             
             sim._maybe_log()
             
-            # Adaptive displacement tuning
             if adaptive and stage_att % max(500, N // 10) == 0:
                 ca = window_acc / max(1, window_att)
                 ema = 0.8 * ema + 0.2 * ca

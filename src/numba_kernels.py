@@ -1,15 +1,14 @@
 """
-src/numba_kernels.py — Numba-accelerated kernels for energy and search
-========================================================================
-Contains all @njit functions used by the simulator.
-Using Numba here provides a 100-1000x speedup over pure Python loops.
+src/numba_kernels.py — Numba-accelerated kernels for energy and search (v5.2)
+==============================================================================
+[FIX v5.2]: Added energy_decomposition() to identify which energy component
+is causing unphysical values. This is critical for debugging potential wells.
 """
 
 import numpy as np
 from numba import njit
 from math import erfc, exp, sqrt, pi
 
-# Import constants directly for use inside njit functions
 from .constants import (
     KE_COULOMB, SWITCH_DR,
     TYPE_SI, TYPE_P, TYPE_O,
@@ -95,7 +94,6 @@ def pair_energy_nonbonded(r, qi, qj, ti, tj, Zi, Zj,
         e_coul = wolf_coulomb(qi, qj, r, alpha, cutoff)
         e_full = e_buck + e_coul
         
-        # Smooth switching function (prevents energy discontinuities)
         x_switch = (r - r_in) / SWITCH_DR
         s = x_switch ** 3 * (10.0 - 15.0 * x_switch + 6.0 * x_switch ** 2)
         return s * e_full + (1.0 - s) * e_zbl
@@ -136,7 +134,6 @@ def local_energy_reactive(idx, coords, charges, types, type_Z,
         dy = yi - coords[j, 1]
         dz = zi - coords[j, 2]
         
-        # Minimum image convention
         dx -= box * round(dx / box)
         dy -= box * round(dy / box)
         dz -= box * round(dz / box)
@@ -148,11 +145,9 @@ def local_energy_reactive(idx, coords, charges, types, type_Z,
         bf = bond_flags[p]
 
         if bf >= 0:
-            # Bonded pair: harmonic + Coulomb only (no Buckingham/ZBL)
             e += bonded_energy_pair(r, bf)
             e += wolf_coulomb(qi, charges[j], r, alpha, cutoff)
         else:
-            # Non-bonded pair: full interaction
             tj = types[j]
             Zj = type_Z[tj]
             e += pair_energy_nonbonded(
@@ -160,7 +155,6 @@ def local_energy_reactive(idx, coords, charges, types, type_Z,
                 A_mat, F_mat, C_mat, R_HARD_MAT,
                 cutoff, alpha, zbl_a0, zbl_c, zbl_d)
 
-    # Wolf self-energy correction
     e += -KE_COULOMB * (alpha / sqrt(pi)) * qi * qi
     return e
 
@@ -184,7 +178,7 @@ def total_energy_reactive(coords, charges, types, type_Z,
         for p in range(starts[i], starts[i + 1]):
             j = neighbors[p]
             if j <= i:
-                continue  # Avoid double counting
+                continue
                 
             dx = xi - coords[j, 0]
             dy = yi - coords[j, 1]
@@ -214,7 +208,102 @@ def total_energy_reactive(coords, charges, types, type_Z,
 
 
 # ============================================================================
-# 3. NETWORK CONNECTIVITY (NC)
+# 3. ENERGY DECOMPOSITION [FIX v5.2]
+# ============================================================================
+
+@njit(fastmath=True, cache=True)
+def energy_decomposition(coords, charges, types, type_Z,
+                         A_mat, F_mat, C_mat, R_HARD_MAT,
+                         neighbors, starts, bond_flags,
+                         box, cutoff, alpha,
+                         zbl_a0, zbl_c, zbl_d):
+    """
+    Decompose total energy into components for debugging.
+    Returns: (e_bonded, e_buck, e_coul, e_zbl)
+    """
+    e_bonded = 0.0
+    e_buck = 0.0
+    e_coul = 0.0
+    e_zbl = 0.0
+    n = coords.shape[0]
+    
+    for i in range(n):
+        xi, yi, zi = coords[i]
+        qi = charges[i]
+        ti = types[i]
+        Zi = type_Z[ti]
+        
+        for p in range(starts[i], starts[i + 1]):
+            j = neighbors[p]
+            if j <= i:
+                continue
+            
+            dx = xi - coords[j, 0]
+            dy = yi - coords[j, 1]
+            dz = zi - coords[j, 2]
+            dx -= box * round(dx / box)
+            dy -= box * round(dy / box)
+            dz -= box * round(dz / box)
+            r2 = dx * dx + dy * dy + dz * dz
+            if r2 >= cutoff * cutoff:
+                continue
+            r = sqrt(r2)
+            bf = bond_flags[p]
+            
+            if bf >= 0:
+                # Bonded pair
+                e_bonded += bonded_energy_pair(r, bf)
+                e_coul += wolf_coulomb(qi, charges[j], r, alpha, cutoff)
+            else:
+                # Non-bonded pair
+                tj = types[j]
+                Zj = type_Z[tj]
+                
+                r_in = R_HARD_MAT[ti, tj]
+                r_out = r_in + SWITCH_DR
+                
+                if r < r_out:
+                    e_zbl_pair = zbl_repulsion(r, Zi, Zj, zbl_a0, zbl_c, zbl_d)
+                    if r < r_in:
+                        e_zbl += e_zbl_pair
+                        continue
+                    
+                    A = A_mat[ti, tj]
+                    F = F_mat[ti, tj]
+                    C = C_mat[ti, tj]
+                    
+                    e_buck_pair = 0.0
+                    if A > 0.0 and F > 1.0e-12:
+                        e_buck_pair += A * exp(-r / F)
+                    if C > 0.0:
+                        e_buck_pair -= C / (r ** 6)
+                    
+                    e_coul_pair = wolf_coulomb(qi, charges[j], r, alpha, cutoff)
+                    e_full = e_buck_pair + e_coul_pair
+                    
+                    x_switch = (r - r_in) / SWITCH_DR
+                    s = x_switch ** 3 * (10.0 - 15.0 * x_switch + 6.0 * x_switch ** 2)
+                    
+                    e_buck += s * e_buck_pair
+                    e_coul += s * e_coul_pair
+                    e_zbl += (1.0 - s) * e_zbl_pair
+                else:
+                    A = A_mat[ti, tj]
+                    F = F_mat[ti, tj]
+                    C = C_mat[ti, tj]
+                    
+                    if A > 0.0 and F > 1.0e-12:
+                        e_buck += A * exp(-r / F)
+                    if C > 0.0:
+                        e_buck -= C / (r ** 6)
+                    
+                    e_coul += wolf_coulomb(qi, charges[j], r, alpha, cutoff)
+    
+    return e_bonded, e_buck, e_coul, e_zbl
+
+
+# ============================================================================
+# 4. NETWORK CONNECTIVITY (NC)
 # ============================================================================
 
 @njit(fastmath=True, cache=True)
@@ -231,21 +320,17 @@ def compute_nc_numba(types, bond_i_arr, bond_j_arr, n_atoms):
     if n_nf == 0:
         return 0.0
 
-    # Count NF bonds per oxygen
     o_nf_count = np.zeros(n_atoms, dtype=np.int32)
     n_bonds = len(bond_i_arr)
     
     for b in range(n_bonds):
         i = bond_i_arr[b]
         j = bond_j_arr[b]
-        # If i is O and j is NF
         if types[i] == TYPE_O and (types[j] == TYPE_SI or types[j] == TYPE_P):
             o_nf_count[i] += 1
-        # If j is O and i is NF
         if types[j] == TYPE_O and (types[i] == TYPE_SI or types[i] == TYPE_P):
             o_nf_count[j] += 1
 
-    # Count BOs (O with exactly 2 NF bonds)
     n_bo = 0
     for i in range(n_atoms):
         if types[i] == TYPE_O and o_nf_count[i] == 2:
@@ -255,19 +340,17 @@ def compute_nc_numba(types, bond_i_arr, bond_j_arr, n_atoms):
 
 
 # ============================================================================
-# 4. LOCAL BOND FLAG UPDATE
+# 5. LOCAL BOND FLAG UPDATE
 # ============================================================================
 
 @njit(fastmath=True, cache=True)
 def update_bond_flag_pair(i, j, bond_type, neighbors, starts, bond_flags):
     """Update bond_flags array locally for a single pair (i, j). O(N_neigh)."""
-    # Update i -> j
     for p in range(starts[i], starts[i + 1]):
         if neighbors[p] == j:
             bond_flags[p] = bond_type
             break
             
-    # Update j -> i
     for p in range(starts[j], starts[j + 1]):
         if neighbors[p] == i:
             bond_flags[p] = bond_type
@@ -275,7 +358,7 @@ def update_bond_flag_pair(i, j, bond_type, neighbors, starts, bond_flags):
 
 
 # ============================================================================
-# 5. CSR-BASED REACTIVE SEARCH (Blazing fast O(N_neigh + N_coord))
+# 6. CSR-BASED REACTIVE SEARCH
 # ============================================================================
 
 @njit(fastmath=True, cache=True)
@@ -294,7 +377,6 @@ def find_o_candidates_for_nf_fast(nf, coords, types, box,
         if j == nf or types[j] != TYPE_O:
             continue
 
-        # Check if already bonded and count O coordination using CSR
         already_bonded = False
         o_coord = 0
         for bp in range(bond_starts[j], bond_starts[j + 1]):
@@ -306,7 +388,6 @@ def find_o_candidates_for_nf_fast(nf, coords, types, box,
         if already_bonded or o_coord >= 2:
             continue
 
-        # Distance check with minimum image
         dx = coords[j, 0] - coords[nf, 0]
         dy = coords[j, 1] - coords[nf, 1]
         dz = coords[j, 2] - coords[nf, 2]
@@ -341,7 +422,6 @@ def find_nf_candidates_for_o_fast(o_atom, coords, types, box,
         if types[j] != TYPE_SI and types[j] != TYPE_P:
             continue
 
-        # Check if already bonded and count NF coordination using CSR
         already_bonded = False
         nf_coord = 0
         for bp in range(bond_starts[j], bond_starts[j + 1]):
@@ -353,7 +433,6 @@ def find_nf_candidates_for_o_fast(o_atom, coords, types, box,
         if already_bonded or nf_coord >= 4:
             continue
 
-        # Distance check with minimum image
         dx = coords[j, 0] - coords[o_atom, 0]
         dy = coords[j, 1] - coords[o_atom, 1]
         dz = coords[j, 2] - coords[o_atom, 2]
