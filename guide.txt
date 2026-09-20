@@ -1,0 +1,25 @@
+# سل-ژل رقیق (چگالی 0.8، بدون اتصال اولیه)
+python solgel_generator.py --density 0.8 --connect 0.0 --seed 42
+
+# سل-ژل معمولی (چگالی 1.0، 10% اتصال اولیه)
+python solgel_generator.py --density 1.0 --connect 0.10 --seed 42
+
+# ژل متراکم‌تر (چگالی 1.2، 30% اتصال اولیه)
+python solgel_generator.py --density 1.2 --connect 0.30 --seed 42
+
+# سیستم بزرگ‌تر (4 برابر)
+python solgel_generator.py --density 1.0 --connect 0.10 --scale 4
+
+
+
+
+....................
+تست  با چگالی های متفاوت برای مقاله 
+# سل رقیق
+python solgel_generator.py --density 0.8 --connect 0.05 --seed 42 --scale 1
+
+# سل معمولی
+python solgel_generator.py --density 1.0 --connect 0.10 --seed 42 --scale 1
+
+# ژل متراکم‌تر
+python solgel_generator.py --density 1.2 --connect 0.20 --seed 42 --scale 1
